@@ -1,0 +1,8 @@
+{
+  "audio_padding": "longest",
+  "encoder_ds_factor": 2,
+  "stack_factor": 8,
+  "audio_placeholder": "<|audio|>",
+  "audio_context_size": 3000,
+  "processor_class": "UltravoxProcessor"
+}
