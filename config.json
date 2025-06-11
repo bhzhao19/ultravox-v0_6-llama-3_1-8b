@@ -50,7 +50,8 @@
   "audio_token_index": 128256,
   "auto_map": {
     "AutoConfig": "ultravox_config.UltravoxConfig",
-    "AutoModel": "ultravox_model.UltravoxModel"
+    "AutoModel": "ultravox_model.UltravoxModel",
+    "AutoProcessor": "ultravox_processing.UltravoxProcessor"
   },
   "custom_pipelines": {
     "ultravox-pipeline": {
