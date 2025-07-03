@@ -1,199 +1,155 @@
 ---
+language:
+- ar
+- be
+- bg
+- bn
+- cs
+- cy
+- da
+- de
+- el
+- en
+- es
+- et
+- fa
+- fi
+- fr
+- gl
+- hi
+- hu
+- it
+- ja
+- ka
+- lt
+- lv
+- mk
+- mr
+- nl
+- pl
+- pt
+- ro
+- ru
+- sk
+- sl
+- sr
+- sv
+- sw
+- ta
+- th
+- tr
+- uk
+- ur
+- vi
+- zh
+license: mit
 library_name: transformers
-tags: []
+metrics:
+- bleu
+pipeline_tag: audio-text-to-text
 ---
 
-# Model Card for Model ID
+# Model Card for Ultravox
 
-<!-- Provide a quick summary of what the model is/does. -->
+Ultravox is a multimodal Speech LLM built around a pretrained LLM (Llama, Gemma, Qwen, etc) and a speech encoder ([whisper-large-v3-turbo](https://huggingface.co/openai/whisper-large-v3-turbo)) backbone.
 
+See https://ultravox.ai for the GitHub repo and more information.
 
 
 ## Model Details
 
 ### Model Description
 
-<!-- Provide a longer summary of what this model is. -->
+Ultravox is a multimodal model that can consume both speech and text as input (e.g., a text system prompt and voice user message). 
+The input to the model is given as a text prompt with a special `<|audio|>` pseudo-token, and the model processor will replace this magic token with embeddings derived from the input audio. Using the merged embeddings as input, the model will then generate output text as usual. 
 
-This is the model card of a 🤗 transformers model that has been pushed on the Hub. This model card has been automatically generated.
+In v0.6 series, ultravox models are trained on expanded Hindi speech data, resulting in significantly improved speech understanding performance on Hindi and modest degradation on other languages. Additionally, the v0.6 models are also trained on noise datasets for improved noise robustness and the ability to output a special string ``((noise))`` if the input audio is too noisy or doesn't contain clear speech. 
 
-- **Developed by:** [More Information Needed]
-- **Funded by [optional]:** [More Information Needed]
-- **Shared by [optional]:** [More Information Needed]
-- **Model type:** [More Information Needed]
-- **Language(s) (NLP):** [More Information Needed]
-- **License:** [More Information Needed]
-- **Finetuned from model [optional]:** [More Information Needed]
+In a future revision of Ultravox, we plan to expand the token vocabulary to support generation of semantic and acoustic audio tokens, which can then be fed to a vocoder to produce voice output.
+No preference tuning has been applied to this revision of the model.
 
-### Model Sources [optional]
+- **Developed by:** Fixie.ai
+- **License:** MIT
 
-<!-- Provide the basic links for the model. -->
+### Model Sources
 
-- **Repository:** [More Information Needed]
-- **Paper [optional]:** [More Information Needed]
-- **Demo [optional]:** [More Information Needed]
+- **Repository:** https://ultravox.ai
+- **Demo:** See repo
 
-## Uses
+## Usage
 
-<!-- Address questions around how the model is intended to be used, including the foreseeable users of the model and those affected by the model. -->
+Think of the model as an LLM that can also hear and understand speech. As such, it can be used as a voice agent, and also to do speech-to-speech translation, analysis of spoken audio, etc.
 
-### Direct Use
+To use the model, try the following:
+```python
+# pip install transformers peft librosa
 
-<!-- This section is for the model use without fine-tuning or plugging into a larger ecosystem/app. -->
+import transformers
+import numpy as np
+import librosa
 
-[More Information Needed]
+pipe = transformers.pipeline(model='fixie-ai/ultravox-v0_6-llama-3_1-8b', trust_remote_code=True)
 
-### Downstream Use [optional]
+path = "<path-to-input-audio>"  # TODO: pass the audio here
+audio, sr = librosa.load(path, sr=16000)
 
-<!-- This section is for the model use when fine-tuned for a task, or when plugged into a larger ecosystem/app -->
 
-[More Information Needed]
+turns = [
+  {
+    "role": "system",
+    "content": "You are a friendly and helpful character. You love to answer questions for people."
+  },
+]
+pipe({'audio': audio, 'turns': turns, 'sampling_rate': sr}, max_new_tokens=30)
+```
 
-### Out-of-Scope Use
-
-<!-- This section addresses misuse, malicious use, and uses that the model will not work well for. -->
-
-[More Information Needed]
-
-## Bias, Risks, and Limitations
-
-<!-- This section is meant to convey both technical and sociotechnical limitations. -->
-
-[More Information Needed]
-
-### Recommendations
-
-<!-- This section is meant to convey recommendations with respect to the bias, risk, and technical limitations. -->
-
-Users (both direct and downstream) should be made aware of the risks, biases and limitations of the model. More information needed for further recommendations.
-
-## How to Get Started with the Model
-
-Use the code below to get started with the model.
-
-[More Information Needed]
 
 ## Training Details
 
+The model uses a pre-trained LLM (Llama, Gemma, Qwen, etc) backbone as well as the encoder part of [whisper-large-v3-turbo](https://huggingface.co/openai/whisper-large-v3-turbo).
+
+The multi-modal adapter is trained, the Whisper encoder is fine-tuned, and the LLM is kept frozen.
+
+We use a knowledge-distillation loss where Ultravox is trying to match the logits of the text-based LLM backbone.
+
 ### Training Data
 
-<!-- This should link to a Dataset Card, perhaps with a short stub of information on what the training data is all about as well as documentation related to data pre-processing or additional filtering. -->
-
-[More Information Needed]
+The training dataset is a mix of ASR datasets, extended with continuations generated by Llama 3.1 8B, speech translation datasets, and noise datasets.
 
 ### Training Procedure
 
-<!-- This relates heavily to the Technical Specifications. Content here should link to that section when it is relevant to the training procedure. -->
-
-#### Preprocessing [optional]
-
-[More Information Needed]
+Supervised speech instruction finetuning via knowledge-distillation. For more info, see [training code in Ultravox repo](https://github.com/fixie-ai/ultravox/blob/main/ultravox/training/train.py).
 
 
 #### Training Hyperparameters
 
-- **Training regime:** [More Information Needed] <!--fp32, fp16 mixed precision, bf16 mixed precision, bf16 non-mixed precision, fp16 non-mixed precision, fp8 mixed precision -->
+- **Training regime:** BF16 mixed precision training
+- **Hardware used:** 8x H100 GPUs
 
-#### Speeds, Sizes, Times [optional]
+#### Speeds, Sizes, Times
 
-<!-- This section provides information about throughput, start/end time, checkpoint size if relevant, etc. -->
+The current version of Ultravox, when invoked with audio content, has a time-to-first-token (TTFT) of approximately 150ms, and a tokens-per-second rate of ~50-100 when using an A100-40GB GPU, all using a text-based LLM (Llama, Gemma, or Qwen) backbone.
 
-[More Information Needed]
+Check out the audio tab on [TheFastest.ai](https://thefastest.ai/?m=audio) for daily benchmarks and a comparison with other existing models.
 
 ## Evaluation
 
-<!-- This section describes the evaluation protocols and provides the results. -->
+Evaluations are conducted on covost2 (speech translation measured in BLEU), fleurs and ultravox_calls (speech recognition measured in WER), big bench audio (audio reasoning measured in accuracy), as well as musan and ultravox_unintelligible (noise/unintelligible speech detection measured in recall).
 
-### Testing Data, Factors & Metrics
-
-#### Testing Data
-
-<!-- This should link to a Dataset Card if possible. -->
-
-[More Information Needed]
-
-#### Factors
-
-<!-- These are the things the evaluation is disaggregating by, e.g., subpopulations or domains. -->
-
-[More Information Needed]
-
-#### Metrics
-
-<!-- These are the evaluation metrics being used, ideally with a description of why. -->
-
-[More Information Needed]
-
-### Results
-
-[More Information Needed]
-
-#### Summary
-
-
-
-## Model Examination [optional]
-
-<!-- Relevant interpretability work for the model goes here -->
-
-[More Information Needed]
-
-## Environmental Impact
-
-<!-- Total emissions (in grams of CO2eq) and additional considerations, such as electricity usage, go here. Edit the suggested text below accordingly -->
-
-Carbon emissions can be estimated using the [Machine Learning Impact calculator](https://mlco2.github.io/impact#compute) presented in [Lacoste et al. (2019)](https://arxiv.org/abs/1910.09700).
-
-- **Hardware Type:** [More Information Needed]
-- **Hours used:** [More Information Needed]
-- **Cloud Provider:** [More Information Needed]
-- **Compute Region:** [More Information Needed]
-- **Carbon Emitted:** [More Information Needed]
-
-## Technical Specifications [optional]
-
-### Model Architecture and Objective
-
-[More Information Needed]
-
-### Compute Infrastructure
-
-[More Information Needed]
-
-#### Hardware
-
-[More Information Needed]
-
-#### Software
-
-[More Information Needed]
-
-## Citation [optional]
-
-<!-- If there is a paper or blog post introducing the model, the APA and Bibtex information for that should go in this section. -->
-
-**BibTeX:**
-
-[More Information Needed]
-
-**APA:**
-
-[More Information Needed]
-
-## Glossary [optional]
-
-<!-- If relevant, include terms and calculations in this section that can help readers understand the model or model card. -->
-
-[More Information Needed]
-
-## More Information [optional]
-
-[More Information Needed]
-
-## Model Card Authors [optional]
-
-[More Information Needed]
-
-## Model Card Contact
-
-[More Information Needed]
+| | v0_5-llama-3_1-8b | v0_6-llama-3_1-8b | v0_5-llama-3_3-70b | v0_6-llama-3_3-70b | v0_6-gemma-3-27b | v0_6-qwen-3-32b |
+| --- | ---: | --: | --: | --: | --: | --: |
+| **covost2 en_ar** | 12.90 | 12.94 | 20.21 | 18.92 | 22.68 | 16.91 | 
+| **covost2 en_ca** | 31.51 | 31.47 | 40.01 | 38.73 | 39.67 | 33.63 |
+| **covost2 en_de** | 28.60 | 28.66 | 34.53 | 33.69 | 34.76 | 31.09 |
+| **covost2 es_en** | 40.41 | 40.36 | 43.29 | 41.39 | 41.11 | 41.20 |
+| **covost2 ru_en** | 42.22 | 42.41 | 48.99 | 43.73 | 49.29 | 47.08 |
+| **covost2 zh_en** | 16.97| 17.24 | 21.37 | 17.81 | 20.88 | 22.24 |
+| **librispeech** | 2.04 | 2.09 | 2.09 | 2.55 | 2.73 | 2.88 | 
+| **fleurs cmn_hans_cn** | 12.11 | 12.25 | 11.20 | 13.49 | 12.56 | 12.10 |
+| **fleurs de_de** | 6.66 | 7.56 | 5.26 | 7.14 | 4.86 | 6.83 |
+| **fleurs es_419** | 5.74 | 5.83 | 4.53 | 6.06 | 4.68 | 5.14 |
+| **fleurs hi_in** | 29.74 | 10.34 | 18.90 | 11.43 | 8.40 | 11.78 |
+| **ultravox_calls (asr)** | 22.31 | 20.01 | 19.56 | 16.51 | 19.56 | 28.67 |
+| **big bench audio**| 62.90 | 62.40 | 90.15 | 85.48 | 83.84 | 84.22 |
+| **musan_noise** | 0.00 | 97.45 | 0.00 | 98.51 | 99.58 | 99.78 | 
+| **ultravox_unintelligible** | 0.00 | 45.78 | 0.00 | 50.00 | 66.84 | 64.21 |
