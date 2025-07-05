@@ -150,6 +150,6 @@ Evaluations are conducted on covost2 (speech translation measured in BLEU), fleu
 | **fleurs es_419** | 5.74 | 5.83 | 4.53 | 6.06 | 4.68 | 5.14 |
 | **fleurs hi_in** | 29.74 | 10.34 | 18.90 | 11.43 | 8.40 | 11.78 |
 | **ultravox_calls (asr)** | 22.31 | 20.01 | 19.56 | 16.51 | 19.56 | 28.67 |
-| **big bench audio**| 62.90 | 62.40 | 90.15 | 85.48 | 83.84 | 84.22 |
+| **big bench audio**| 68.06 | 69.70 | 90.15 | 85.48 | 83.84 | 84.22 |
 | **musan_noise** | 0.00 | 97.45 | 0.00 | 98.51 | 99.58 | 99.78 | 
 | **ultravox_unintelligible** | 0.00 | 45.78 | 0.00 | 50.00 | 66.84 | 64.21 |
