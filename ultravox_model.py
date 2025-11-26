@@ -46,22 +46,22 @@ class UltravoxModel(transformers.LlamaPreTrainedModel, GenerationMixin):
     │ Waveforms   │     │ (Whisper/    │     │ (Linear     │     │ Embeddings  │
     │             │     │  Wav2Vec2)   │     │  Layers)    │     │             │
     └─────────────┘     └──────────────┘     └─────────────┘     └──────┬──────┘
-                                                                         │
-    ┌─────────────┐                                                      │
-    │ Text Tokens │ --> │ Text Embeddings │ ---------------------------┘
-    │             │     │ (LLM Embedding)  │
-    └─────────────┘     └─────────────────┘
+                                                                        │
+    ┌─────────────┐     ┌─────────────────┐                             │
+    │ Text Tokens │ --> │ Text Embeddings │ ----------------------------┘
+    │             │     │ (LLM Embedding) │           |
+    └─────────────┘     └─────────────────┘           |
                                                       │
                                                       ▼
                                             ┌─────────────────┐
                                             │ Language Model  │
-                                            │   (Llama LLM)    │
+                                            │   (Llama LLM)   │
                                             └─────────────────┘
                                                       │
                                                       ▼
                                             ┌─────────────────┐
-                                            │  Output Logits   │
-                                            │   / Loss         │
+                                            │  Output Logits  │
+                                            │   / Loss        │
                                             └─────────────────┘
     
     KEY COMPONENTS:
