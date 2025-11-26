@@ -32,14 +32,64 @@ SHARED_PRETRAINED_KWARGS = [
 
 class UltravoxModel(transformers.LlamaPreTrainedModel, GenerationMixin):
     """
-    The Ultravox model which consists of an audio encoder and a language model.
-
-    Audio input is processed by the audio encoder, then every `stack_factor` frames are stacked together and
-    projected to the language model's embedding space using a few linear layers.
-    The text is embedded by the language model as usual and then the audio and text embeddings are merged together.
-
-    A special token `<|audio|>` is used to indicate the start of the audio embeddings in the merged embeddings.
-
+    ============================================================================
+    ULTRAVOX MODEL ARCHITECTURE
+    ============================================================================
+    
+    Ultravox is a multi-modal model that combines audio understanding with language
+    modeling. It processes audio and text inputs together to enable audio-conditioned
+    text generation.
+    
+    ARCHITECTURE OVERVIEW:
+    ┌─────────────┐     ┌──────────────┐     ┌─────────────┐     ┌─────────────┐
+    │ Raw Audio   │ --> │ Audio Tower  │ --> │  Projector  │ --> │   Merged    │
+    │ Waveforms   │     │ (Whisper/    │     │ (Linear     │     │ Embeddings  │
+    │             │     │  Wav2Vec2)   │     │  Layers)    │     │             │
+    └─────────────┘     └──────────────┘     └─────────────┘     └──────┬──────┘
+                                                                         │
+    ┌─────────────┐                                                      │
+    │ Text Tokens │ --> │ Text Embeddings │ ---------------------------┘
+    │             │     │ (LLM Embedding)  │
+    └─────────────┘     └─────────────────┘
+                                                      │
+                                                      ▼
+                                            ┌─────────────────┐
+                                            │ Language Model  │
+                                            │   (Llama LLM)    │
+                                            └─────────────────┘
+                                                      │
+                                                      ▼
+                                            ┌─────────────────┐
+                                            │  Output Logits   │
+                                            │   / Loss         │
+                                            └─────────────────┘
+    
+    KEY COMPONENTS:
+    1. Audio Tower: Encodes raw audio waveforms into feature embeddings
+       - Supports Whisper or Wav2Vec2 encoders
+       - Output: (batch, audio_frames, audio_hidden_dim)
+    
+    2. Multi-modal Projector: Bridges audio and text embedding spaces
+       - Stacks audio frames (reduces sequence length by stack_factor)
+       - Projects from audio_dim to text_dim via 2 linear layers
+       - Output: (batch, reduced_frames, text_hidden_dim)
+    
+    3. Language Model: Processes fused audio-text embeddings
+       - Uses Llama architecture for causal language modeling
+       - Receives merged embeddings where audio replaces <|audio|> tokens
+       - Output: Next token predictions and loss
+    
+    DATA FLOW:
+    1. Audio waveforms → Audio Tower → Audio embeddings (audio_dim)
+    2. Audio embeddings → Stack frames → Projector → Text-space embeddings (text_dim)
+    3. Text tokens → Text embeddings (text_dim)
+    4. Merge: Replace <|audio|> token positions with projected audio embeddings
+    5. Fused embeddings → LLM → Predictions
+    
+    SPECIAL TOKEN:
+    - <|audio|>: Marks where audio embeddings should be inserted in the text sequence
+      The projector output replaces this token's embedding in the sequence.
+    
     Parameters:
         config: Model configuration class with all the parameters of the model.
     """
@@ -53,6 +103,16 @@ class UltravoxModel(transformers.LlamaPreTrainedModel, GenerationMixin):
     accepts_loss_kwargs = False
 
     def __init__(self, config: UltravoxConfig):
+        """
+        Initialize the Ultravox model architecture.
+        
+        This method constructs the three main components of the model:
+        1. Audio Tower (encoder)
+        2. Multi-modal Projector
+        3. Language Model (LLM)
+        
+        Each component can be loaded from pretrained weights or initialized from config.
+        """
         logging.info(f"__init__:config: {config}")
         super().__init__(config)
         self._register_load_state_dict_pre_hook(self._pre_load_state_dict_hook)
@@ -60,11 +120,36 @@ class UltravoxModel(transformers.LlamaPreTrainedModel, GenerationMixin):
         self.keep_params: Set[str] = set()
         self.vocab_size = config.vocab_size
 
+        # ========================================================================
+        # COMPONENT 1: Audio Tower (Encoder)
+        # ========================================================================
+        # Encodes raw audio waveforms into feature embeddings.
+        # - Input: Raw audio waveforms (mel spectrograms for Whisper)
+        # - Output: Audio feature embeddings of shape (batch, frames, audio_hidden_dim)
+        # - Supports: Whisper encoder or Wav2Vec2-based models
+        # - Can be frozen or fine-tuned with LoRA
         self.audio_tower = self._create_audio_tower(config)
         self.audio_tower_context_length: Optional[int] = None
         self.audio_tower_context_length = self.audio_tower.max_context_length
 
+        # ========================================================================
+        # COMPONENT 2: Multi-modal Projector
+        # ========================================================================
+        # Projects audio embeddings from audio space to text embedding space.
+        # - Input: Audio embeddings (batch, frames, audio_hidden_dim)
+        # - Process: Stack frames → Linear1 → Activation → Linear2
+        # - Output: Text-space embeddings (batch, reduced_frames, text_hidden_dim)
+        # - Key: Reduces sequence length by stack_factor while increasing channel dim
         self.multi_modal_projector = self._create_multi_modal_projector(config)
+        
+        # ========================================================================
+        # COMPONENT 3: Language Model (LLM)
+        # ========================================================================
+        # Processes fused audio-text embeddings for generation.
+        # - Input: Merged embeddings where audio replaces <|audio|> tokens
+        # - Architecture: Llama-based causal language model
+        # - Output: Next token logits and loss
+        # - Can be frozen or fine-tuned with LoRA
         self.language_model = self._create_language_model(config)
 
         if self.language_model._tied_weights_keys is not None:
@@ -202,10 +287,43 @@ class UltravoxModel(transformers.LlamaPreTrainedModel, GenerationMixin):
         alt_labels: Optional[torch.Tensor] = None,
         **kwargs,
     ):
-        # disable gradient computation for the teacher model
+        """
+        ========================================================================
+        KL DIVERGENCE LOSS: Knowledge Distillation
+        ========================================================================
+        
+        This implements knowledge distillation where:
+        - Student: Audio-text model (current model with audio inputs)
+        - Teacher: Text-only model (same model but without audio)
+        
+        GOAL: Make the audio-text model produce similar predictions to the
+              text-only model, ensuring audio enhances rather than changes outputs.
+        
+        PROCESS:
+        1. Run teacher (text-only) forward pass (no gradients)
+        2. Compare student and teacher logit distributions
+        3. Compute KL divergence loss
+        4. Optionally weight EOT (end-of-turn) token positions more heavily
+        
+        WHY KL DIVERGENCE?
+        - Aligns probability distributions, not just predictions
+        - Captures uncertainty and confidence levels
+        - Temperature scaling makes distributions softer for better learning
+        
+        TEMPERATURE SCALING:
+        - Divides logits by temperature before softmax
+        - Higher temperature = softer distribution (more uncertainty)
+        - Helps with knowledge transfer
+        """
+        # ========================================================================
+        # STEP 1: Compute Teacher (Text-Only) Model Outputs
+        # ========================================================================
+        # The teacher model is the same architecture but processes text-only inputs
+        # We disable gradients because we're using it as a fixed reference
         with torch.no_grad():
-            # compute the teacher (text-only) model's distribution
+            # Embed text tokens (no audio here - this is the text-only version)
             alt_inputs_embeds = self.get_input_embeddings().forward(alt_input_ids)
+            # Forward through language model (text-only, no audio merged)
             alt_lm_output = self.language_model.forward(
                 inputs_embeds=alt_inputs_embeds,
                 labels=alt_labels,
@@ -214,24 +332,47 @@ class UltravoxModel(transformers.LlamaPreTrainedModel, GenerationMixin):
                 **kwargs,
             )
 
-        # Get prediction masks for regular tokens and EOT tokens
+        # ========================================================================
+        # STEP 2: Get Prediction Masks
+        # ========================================================================
+        # We need masks to identify:
+        # - pred_mask: All positions where we make predictions (before each label)
+        # - eot_mask: Last prediction position in each sequence (end-of-turn)
+        # The EOT position is important because it's where the model decides to stop
         pred_mask, eot_mask = self._get_prediction_mask(labels)
         alt_pred_mask, alt_eot_mask = self._get_prediction_mask(alt_labels)
 
-        # compute the KL divergence loss between the two models for regular tokens
+        # ========================================================================
+        # STEP 3: Compute KL Divergence for Regular Tokens
+        # ========================================================================
+        # KL divergence measures how different two probability distributions are
+        # We want to minimize this difference between student and teacher
+        # 
+        # Formula: KL(P_student || P_teacher) = sum(P_student * log(P_student / P_teacher))
+        # 
+        # Temperature scaling:
+        # - Divides logits by temperature before softmax
+        # - Makes distributions "softer" (more uniform)
+        # - Helps with knowledge transfer
         kl_loss = F.kl_div(
+            # Student distribution (audio-text model)
             F.log_softmax(
                 lm_output.logits[pred_mask] / self.loss_config.kl_temperature,
                 dim=-1,
             ),
+            # Teacher distribution (text-only model)
             F.softmax(
                 alt_lm_output.logits[alt_pred_mask] / self.loss_config.kl_temperature,
                 dim=-1,
             ),
-            reduction="batchmean",
+            reduction="batchmean",  # Average over batch
         )
 
-        # Compute the KL divergence loss for EOT token positions if any exist
+        # ========================================================================
+        # STEP 4: Compute Additional KL Loss for EOT Tokens (Optional)
+        # ========================================================================
+        # EOT (end-of-turn) tokens are critical because they indicate when to stop
+        # We can weight these positions more heavily to ensure proper stopping behavior
         if self.loss_config.eot_loss_weight > 0:
             eot_loss = F.kl_div(
                 F.log_softmax(
@@ -245,6 +386,7 @@ class UltravoxModel(transformers.LlamaPreTrainedModel, GenerationMixin):
                 ),
                 reduction="batchmean",
             )
+            # Add weighted EOT loss to main KL loss
             kl_loss += self.loss_config.eot_loss_weight * eot_loss
 
         return kl_loss
@@ -253,13 +395,22 @@ class UltravoxModel(transformers.LlamaPreTrainedModel, GenerationMixin):
         self, audio_batch_size: torch.Tensor
     ) -> Generator[Tuple[int, int], None, None]:
         """
-        Iterate over the audio batch size and yield the batch index and audio index of each audio item.
-
+        Helper iterator for mapping audio samples to text samples in batches.
+        
+        This handles the case where multiple audio samples can map to one text sample.
+        For example, a conversation might have multiple audio turns but one text sequence.
+        
         Args:
-            audio_batch_size: A tensor of shape (B,) where B is the batch size.
-
-        Returns:
-            A generator that yields a tuple of (start index, length) for each audio item.
+            audio_batch_size: Tensor of shape (B,) indicating how many audio samples
+                            each text sample has. Example: [2, 1, 3] means:
+                            - Text sample 0 has 2 audio samples
+                            - Text sample 1 has 1 audio sample
+                            - Text sample 2 has 3 audio samples
+        
+        Yields:
+            (batch_idx, audio_idx): Tuple mapping text batch index to audio index
+            Example: For [2, 1, 3], yields:
+                    (0, 0), (0, 1), (1, 2), (2, 3), (2, 4), (2, 5)
         """
         audio_index = 0
         for i_b, batch_count in enumerate(audio_batch_size):
@@ -286,29 +437,86 @@ class UltravoxModel(transformers.LlamaPreTrainedModel, GenerationMixin):
         **kwargs,
     ) -> transformers.modeling_outputs.CausalLMOutputWithPast:
         """
-        Forward pass for the Ultravox model.
-
-        `input_ids` are the tokenized text input. They are embedded by the language model as usual.
-        `audio_values` are processed by the audio encoder and then every `stack_factor` frames are stacked together and
-        projected to the language model's embedding space using a few linear layers.
-        The audio and text embeddings are merged together. A special token `<|audio|>` is used to indicate the start
-        of the audio embeddings in the merged embeddings.
-
+        ========================================================================
+        FORWARD PASS: How the Model Processes Audio and Text
+        ========================================================================
+        
+        This is the core forward pass that processes audio and text inputs together.
+        
+        PROCESSING PIPELINE:
+        
+        STEP 1: Embed Text Tokens
+        ─────────────────────────
+        - Input: input_ids (batch, seq_len) - tokenized text
+        - Process: Lookup in LLM's embedding table
+        - Output: inputs_embeds (batch, seq_len, text_hidden_dim)
+        - Note: If inputs_embeds already provided, skip this step
+        
+        STEP 2: Process Audio (if provided)
+        ───────────────────────────────────
+        - Input: audio_values (batch, audio_length) - raw audio waveforms
+        - Process through Audio Tower:
+          * Converts raw audio to mel spectrograms (for Whisper)
+          * Encodes through transformer layers
+          * Output: (batch, audio_frames, audio_hidden_dim)
+        - Process through Projector:
+          * Stacks frames (reduces length by stack_factor)
+          * Projects to text embedding space
+          * Output: (batch, reduced_frames, text_hidden_dim)
+        
+        STEP 3: Merge Audio and Text Embeddings
+        ────────────────────────────────────────
+        - Find <|audio|> token positions in text sequence
+        - Replace those token embeddings with projected audio embeddings
+        - Result: Unified sequence with audio "injected" at specific positions
+        - Example: [text_tokens...] <|audio|> [more_text...]
+                  becomes: [text_embeds...] [audio_embeds...] [text_embeds...]
+        
+        STEP 4: Process Through Language Model
+        ───────────────────────────────────────
+        - Input: Merged embeddings (batch, total_seq_len, text_hidden_dim)
+        - Process: Standard causal language model forward pass
+        - Output: Logits for next token prediction + loss (if labels provided)
+        
+        STEP 5: Compute Loss (if training)
+        ──────────────────────────────────
+        - CrossEntropy: Standard next-token prediction loss
+        - KL Divergence: Distillation loss between audio-text model and text-only model
+        
+        KEY PARAMETERS:
+        - audio_token_start_idx: Position in text sequence where audio embeddings start
+        - audio_token_len: How many tokens the audio embeddings span
+        - audio_lens: Actual audio lengths (for masking padding)
+        - audio_batch_size: How many audio samples per text sample (for batching)
+        
         Args:
-            input_ids: The tokenized text input.
-            audio_values: The processed audio values.
-            inputs_embeds: The embeddings for the input tokens.
-            labels: The tokenized text labels.
-            attention_mask: The attention mask for the input.
-            position_ids: The position ids for the input.
-            past_key_values: The past key value cache for the language model attention layers.
-            **kwargs: Additional keyword arguments. Passed directly to the language model.
+            input_ids: Tokenized text input (batch, seq_len)
+            audio_values: Raw audio waveforms (list of tensors, variable length)
+            inputs_embeds: Pre-computed text embeddings (optional, batch, seq_len, dim)
+            labels: Ground truth tokens for loss computation (batch, seq_len)
+            attention_mask: Mask for valid positions (batch, seq_len)
+            audio_token_start_idx: Start positions for audio in text sequence
+            audio_lens: Actual lengths of audio samples (for padding)
+            audio_token_len: Number of tokens each audio sample produces
+            audio_batch_size: Number of audio samples per text sample
+            past_key_values: Cached key-value pairs for generation
+            alt_*: Alternative text-only inputs for KL divergence loss
+            **kwargs: Additional arguments passed to language model
         """
+        # ========================================================================
+        # STEP 1: Embed Text Tokens
+        # ========================================================================
+        # Convert token IDs to embeddings using the LLM's embedding layer
+        # Shape: (batch, seq_len) -> (batch, seq_len, text_hidden_dim)
         if inputs_embeds is None:
             # B x T  ->  B x T x D
             inputs_embeds = self.get_input_embeddings().forward(input_ids)
 
+        # ========================================================================
+        # STEP 2-3: Process and Merge Audio Embeddings (if audio provided)
+        # ========================================================================
         if audio_values is not None and len(audio_values) > 0:
+            # Validate that all required audio metadata is provided
             assert (
                 audio_token_start_idx is not None
                 and audio_token_len is not None
@@ -325,21 +533,51 @@ class UltravoxModel(transformers.LlamaPreTrainedModel, GenerationMixin):
                 inputs_embeds
             ), "audio_batch_size and inputs_embeds must have the same batch size."
 
+            # STEP 2a: Audio Tower - Encode raw audio to feature embeddings
+            # Input: audio_values (list of variable-length audio tensors)
+            # Output: (batch, audio_frames, audio_hidden_dim)
+            # The audio tower handles:
+            # - Converting raw audio to mel spectrograms (Whisper) or features (Wav2Vec2)
+            # - Processing through convolutional layers
+            # - Encoding through transformer encoder layers
+            # - Applying attention masks based on actual audio lengths
             # B x A/3200 x (D=max-audio-length-in-batch)
             audio_tower_output = self.audio_tower.forward(
                 audio_values.to(self.audio_tower.dtype),
                 audio_len=audio_lens,
             ).last_hidden_state
             audio_tower_output = audio_tower_output.to(inputs_embeds.dtype)
+            
+            # STEP 2b: Multi-modal Projector - Project audio embeddings to text space
+            # Input: (batch, audio_frames, audio_hidden_dim)
+            # Process: Stack frames → Linear1 → Activation → Linear2
+            # Output: (batch, reduced_frames, text_hidden_dim)
+            # This aligns audio embeddings with text embedding dimensions
             audio_embeds = self.multi_modal_projector.forward(audio_tower_output)
 
-            # combine audio and text embeddings
+            # STEP 3: Merge audio embeddings into text embeddings at <|audio|> positions
+            # For each text sample, find where <|audio|> tokens are and replace them
+            # with the corresponding projected audio embeddings
+            # 
+            # Example merging:
+            #   Text sequence: [token1, token2, <|audio|>, token3, token4]
+            #   Text embeddings: [emb1, emb2, audio_token_emb, emb3, emb4]
+            #   After merge:    [emb1, emb2, audio_emb1, audio_emb2, ..., emb3, emb4]
+            #
+            # The loop handles batching where multiple audio samples map to one text sample
             for i_b, i_a in self._audio_iter(audio_batch_size):
-                start_idx = audio_token_start_idx[i_a]
-                token_len = audio_token_len[i_a]
-                item_embedding = audio_embeds[i_a][:token_len]
+                start_idx = audio_token_start_idx[i_a]  # Where to insert in text sequence
+                token_len = audio_token_len[i_a]        # How many tokens to insert
+                item_embedding = audio_embeds[i_a][:token_len]  # Get audio embeddings
+                # Replace text embeddings at <|audio|> positions with audio embeddings
                 inputs_embeds[i_b][start_idx : start_idx + token_len] = item_embedding
 
+        # ========================================================================
+        # STEP 4: Process Through Language Model
+        # ========================================================================
+        # Now we have a unified sequence with audio embeddings merged into text
+        # Process through the LLM as a standard causal language model
+        # The LLM doesn't know which tokens are audio vs text - it just sees embeddings
         lm_output = self.language_model.forward(
             inputs_embeds=inputs_embeds,
             labels=labels,
@@ -347,9 +585,22 @@ class UltravoxModel(transformers.LlamaPreTrainedModel, GenerationMixin):
             past_key_values=past_key_values,
             **kwargs,
         )
+        # ========================================================================
+        # STEP 5: Compute Loss (if training)
+        # ========================================================================
+        # The model supports two loss functions:
+        # 1. CrossEntropy: Standard next-token prediction loss (default)
+        # 2. KL Divergence: Distillation loss that aligns audio-text model with text-only model
         if self.loss_config.loss_function == LossFunction.CrossEntropy:
+            # Standard cross-entropy loss already computed by language_model.forward()
+            # No additional processing needed
             pass
         elif self.loss_config.loss_function == LossFunction.KL_Divergence:
+            # KL divergence loss for knowledge distillation
+            # Compares predictions from:
+            # - Student: Audio-text model (current forward pass)
+            # - Teacher: Text-only model (alt_input_ids without audio)
+            # This helps the model learn to generate similar outputs with/without audio
             lm_output.loss = self._compute_kl_loss(
                 lm_output=lm_output,
                 labels=labels,
@@ -691,19 +942,60 @@ def apply_lora(model: T, lora_config: dict) -> T:
 
 class StackAudioFrames(nn.Module):
     """
-    Stack the audio embedding frames to reduce the sequence length by a factor
-    of `stack_factor`.
+    ============================================================================
+    STACK AUDIO FRAMES: Reducing Sequence Length
+    ============================================================================
+    
+    This module reduces the sequence length of audio embeddings by stacking
+    consecutive frames together. This is crucial for aligning audio frame rate
+    with text token rate.
+    
+    WHY STACKING?
+    - Audio encoders produce high frame rates (e.g., 50 frames/second)
+    - Text models work with lower token rates (e.g., 2-5 tokens/second)
+    - Stacking balances these rates by combining multiple frames into one token
+    
+    TRANSFORMATION:
+    Input:  (batch, frames, channels)
+            Example: (2, 80, 512)  [80 frames, 512-dim embeddings]
+    
+    Process:
+    1. Pad to multiple of stack_factor: (2, 80, 512) -> (2, 80, 512) [already multiple of 8]
+    2. Reshape: (2, 80, 512) -> (2, 10, 4096)  [80/8=10, 512*8=4096]
+    
+    Output: (batch, frames/stack_factor, channels*stack_factor)
+            Example: (2, 10, 4096)  [10 tokens, 4096-dim stacked embeddings]
+    
+    Example with stack_factor=8:
+    - Before: 80 frames × 512 dims = 80 tokens
+    - After:  10 tokens × 4096 dims = 10 tokens
+    - Sequence length reduced by 8x, channel dimension increased by 8x
     """
-
     def __init__(self, stack_factor: int = 8):
         super().__init__()
         self.stack_factor = stack_factor
 
     def forward(self, audio_embeds: torch.Tensor) -> torch.Tensor:
+        """
+        Stack audio frames to reduce sequence length.
+        
+        Process:
+        1. Pad sequence to be divisible by stack_factor
+        2. Reshape: (B, T, C) -> (B, T//S, C*S)
+           where S = stack_factor
+        
+        Example:
+          Input:  (2, 77, 512) with stack_factor=8
+          Pad:    (2, 80, 512)  [pad to next multiple of 8]
+          Reshape: (2, 10, 4096) [80/8=10, 512*8=4096]
+        """
         B, T, C = audio_embeds.shape
+        # Calculate padding needed to make T divisible by stack_factor
         T_pad = (T + self.stack_factor - 1) // self.stack_factor * self.stack_factor
+        # Pad along sequence dimension (last dimension is channels, don't pad that)
         audio_embeds = F.pad(audio_embeds, (0, 0, 0, T_pad - T))
         B, T, C = audio_embeds.shape
+        # Reshape: combine stack_factor frames into one, increase channels
         audio_embeds = audio_embeds.view(
             B, T // self.stack_factor, C * self.stack_factor
         )
@@ -723,60 +1015,196 @@ class SwiGLU(nn.Module):
 
 
 class UltravoxProjector(nn.Module):
+    """
+    ============================================================================
+    MULTI-MODAL PROJECTOR: Bridging Audio and Text Embedding Spaces
+    ============================================================================
+    
+    This is a critical architectural component that projects audio embeddings
+    from the audio encoder's space into the text language model's embedding space.
+    
+    ARCHITECTURE:
+    ┌─────────────────┐
+    │ Audio Embeddings│ (batch, frames, audio_hidden_dim)
+    │ from Audio Tower │
+    └────────┬────────┘
+             │
+             ▼
+    ┌─────────────────┐
+    │ Stack Frames     │ Reduces sequence length by stack_factor
+    │ (stack_factor)   │ Increases channel dim by stack_factor
+    └────────┬────────┘ (batch, frames/stack_factor, audio_hidden_dim*stack_factor)
+             │
+             ▼
+    ┌─────────────────┐
+    │ Pre-Norm (RMS)   │ Normalize stacked features
+    └────────┬────────┘
+             │
+             ▼
+    ┌─────────────────┐
+    │ Linear 1        │ Project to intermediate dimension
+    │ (dim_in → H)     │ (batch, frames/stack_factor, hidden_dim)
+    └────────┬────────┘
+             │
+             ▼
+    ┌─────────────────┐
+    │ Activation       │ SwiGLU or other activation
+    │ (SwiGLU halves)  │ (batch, frames/stack_factor, hidden_dim/2)
+    └────────┬────────┘
+             │
+             ▼
+    ┌─────────────────┐
+    │ Mid-Norm (RMS)   │ Normalize after activation (v0.5.0+)
+    │ or Post-Norm     │ or after Linear2 (v0.4.1-)
+    └────────┬────────┘
+             │
+             ▼
+    ┌─────────────────┐
+    │ Linear 2        │ Project to text embedding dimension
+    │ (H/2 → text_dim)│ (batch, frames/stack_factor, text_hidden_dim)
+    └────────┬────────┘
+             │
+             ▼
+    ┌─────────────────┐
+    │ Post-Norm (RMS) │ Final normalization
+    └─────────────────┘
+             │
+             ▼
+    ┌─────────────────┐
+    │ Text-Space       │ Ready to merge with text embeddings
+    │ Embeddings       │
+    └─────────────────┘
+    
+    KEY DESIGN DECISIONS:
+    1. Stacking: Reduces sequence length to match text token density
+       - Audio: High frame rate (e.g., 50 frames/sec)
+       - Text: Lower token rate (e.g., 2-5 tokens/sec)
+       - Stacking balances the rates
+    
+    2. Two-stage projection: 
+       - Linear1: Maps to intermediate dimension (config.hidden_size)
+       - Linear2: Maps to text dimension (text_config.hidden_size)
+       - Allows flexible dimension matching
+    
+    3. SwiGLU activation: Gated activation that halves dimension
+       - More expressive than ReLU
+       - Common in modern LLMs (Llama uses it)
+    
+    4. Layer norm placement: Varies by version
+       - v0.5.0+: After Linear1 (mid-norm)
+       - v0.4.1-: After Linear2 (post-norm)
+    """
     def __init__(self, config: UltravoxConfig):
         super().__init__()
         self.hidden_dim = config.hidden_size
+        
+        # Stack audio frames to reduce sequence length
+        # Example: stack_factor=8 means 8 frames become 1 token
+        # Input: (batch, 80, 512) -> Output: (batch, 10, 4096)
         self._pad_and_stack = StackAudioFrames(config.stack_factor)
+        
+        # After stacking, input dimension is audio_hidden_size * stack_factor
+        # Example: 512 * 8 = 4096
         dim_in = config.audio_config.hidden_size * config.stack_factor
         self.ln_pre = RMSNorm(dim_in, init=config.norm_init)
+        
+        # First linear projection: stacked_audio_dim -> hidden_dim
+        # Example: 4096 -> 2048
         self.linear_1 = nn.Linear(dim_in, self.hidden_dim, bias=False)
         dim_mid = self.hidden_dim
+        
+        # Activation function (SwiGLU halves the dimension)
         self.act = transformers.activations.get_activation(config.projector_act)
         dim_mid = dim_mid // 2 if config.projector_act == "swiglu" else dim_mid
+        # Example: 2048 -> 1024 (if SwiGLU)
+        
+        # Second linear projection: hidden_dim/2 -> text_hidden_dim
+        # Example: 1024 -> 4096 (if text model is 4096-dim)
         dim_out = config.text_config.hidden_size
         self.linear_2 = nn.Linear(dim_mid, dim_out, bias=False)
 
+        # Layer norm placement varies by version:
         # Ultravox v0.4.1 and below uses layer_norm after the second linear layer,
         # while v0.5.0 and above uses layer_norm after the first linear layer.
         if config.projector_ln_mid:
+            # v0.5.0+: Normalize after Linear1 (before Linear2)
             self.ln_mid: nn.Module = RMSNorm(dim_mid, init=config.norm_init)
             self.ln_post: nn.Module = nn.Identity()
         else:
+            # v0.4.1-: Normalize after Linear2 (final output)
             self.ln_mid = nn.Identity()
             self.ln_post = RMSNorm(dim_out, init=config.norm_init)
 
     def forward(self, audio_features: torch.Tensor) -> torch.Tensor:
         """
-        Takes in audio features from the audio tower and projects them to the text model's embedding space.
-        It reduces the number of frames by a factor of `stack_factor` and increases the number of channels by the same factor.
-        If the number of audio frames are not a multiple of the stack factor, the last few frames will be padded with zeros.
+        Forward pass through the projector.
+        
+        TRANSFORMATION PIPELINE:
+        Input:  (batch, audio_frames, audio_hidden_dim)
+                Example: (2, 80, 512)
+        
+        Step 1 - Stack: (batch, frames/stack_factor, audio_dim*stack_factor)
+                 Example: (2, 10, 4096)  [80 frames -> 10 tokens, 512 -> 4096]
+        
+        Step 2 - Linear1: (batch, frames/stack_factor, hidden_dim)
+                 Example: (2, 10, 2048)
+        
+        Step 3 - Activation: (batch, frames/stack_factor, hidden_dim/2)
+                 Example: (2, 10, 1024)  [SwiGLU halves dimension]
+        
+        Step 4 - Linear2: (batch, frames/stack_factor, text_hidden_dim)
+                 Example: (2, 10, 4096)
+        
+        Output: (batch, reduced_frames, text_hidden_dim)
+                Ready to merge with text embeddings!
 
         Input shape:
-            audio_features: B, T*S, C
+            audio_features: B, F, C
+                B: batch size
+                F: number of frames from audio tower
+                C: audio_hidden_dim (e.g., 512 for Whisper)
+        
         Output shape:
             hidden_states: B, T, D
+                B: batch size
+                T: number of output embeddings = ceil(F / stack_factor)
+                D: text_hidden_dim (e.g., 4096 for Llama)
+        
         Where:
-            B: batch size
-            F: number of frames in the audio tower
-            T: number of output embeddings
-                T = ceil(F / S)
-            S: stack factor
-            C: number of channels out of the encoder (aka audio tower)
-            H: hidden size of the projector (config.hidden_size)
-            D: dimension of the text model (config.text_config.hidden_size)
-
+            S: stack_factor (e.g., 8)
+            H: hidden_dim (intermediate dimension, e.g., 2048)
         """
-        # B, F, C -> B, T, C*S
+        # STEP 1: Stack frames to reduce sequence length
+        # Input: (B, F, C) -> Output: (B, T, C*S) where T = ceil(F/S)
+        # Example: (2, 80, 512) -> (2, 10, 4096) with stack_factor=8
+        # Padding is applied if F is not divisible by stack_factor
         audio_features = self._pad_and_stack(audio_features)
+        
+        # STEP 2: Pre-normalization
+        # Normalize the stacked features before first linear layer
         audio_features = self.ln_pre(audio_features)
-        # B, T, C*S -> B, T, H
+        
+        # STEP 3: First linear projection
+        # (B, T, C*S) -> (B, T, H)
+        # Example: (2, 10, 4096) -> (2, 10, 2048)
         hidden_states = self.linear_1(audio_features)
-        # B, T, H -> B, T, H/2 (assuming swiglu)
+        
+        # STEP 4: Activation (SwiGLU halves dimension)
+        # (B, T, H) -> (B, T, H/2)
+        # Example: (2, 10, 2048) -> (2, 10, 1024)
         hidden_states = self.act(hidden_states)
+        
+        # STEP 5: Mid normalization (v0.5.0+) or skip (v0.4.1-)
         hidden_states = self.ln_mid(hidden_states)
-        # B, T, H/2 -> B, T, D
+        
+        # STEP 6: Second linear projection to text dimension
+        # (B, T, H/2) -> (B, T, D)
+        # Example: (2, 10, 1024) -> (2, 10, 4096)
         hidden_states = self.linear_2(hidden_states)
+        
+        # STEP 7: Post normalization (v0.4.1-) or skip (v0.5.0+)
         hidden_states = self.ln_post(hidden_states)
+        
         return hidden_states
 
 
@@ -784,9 +1212,66 @@ class ModifiedWhisperEncoder(
     whisper.WhisperEncoder, transformers.modeling_utils.ModuleUtilsMixin
 ):
     """
-    Encoder portion of OpenAI's Whisper model.
-
-    This implementation is a slightly modified version of HF Transformers' Whisper Encoder, with only a few fixes:
+    ============================================================================
+    AUDIO TOWER: Whisper Encoder for Audio Processing
+    ============================================================================
+    
+    This is the audio encoding component that processes raw audio waveforms
+    into feature embeddings. It's based on OpenAI's Whisper encoder architecture.
+    
+    ARCHITECTURE:
+    ┌─────────────────┐
+    │ Raw Audio        │ Audio waveforms or mel spectrograms
+    │ (mel features)   │ Shape: (batch, n_mels, seq_len)
+    └────────┬────────┘
+             │
+             ▼
+    ┌─────────────────┐
+    │ Conv1 + GELU     │ First convolutional layer
+    │ (stride reduction)│ Reduces sequence length
+    └────────┬────────┘
+             │
+             ▼
+    ┌─────────────────┐
+    │ Conv2 + GELU     │ Second convolutional layer
+    │ (stride reduction)│ Further reduces sequence length
+    └────────┬────────┘
+             │
+             ▼
+    ┌─────────────────┐
+    │ Positional      │ Add positional embeddings
+    │ Embeddings      │
+    └────────┬────────┘
+             │
+             ▼
+    ┌─────────────────┐
+    │ Transformer     │ Stack of encoder layers
+    │ Encoder Layers  │ Self-attention + FFN
+    │ (6 layers)      │
+    └────────┬────────┘
+             │
+             ▼
+    ┌─────────────────┐
+    │ Layer Norm      │ Final normalization
+    └────────┬────────┘
+             │
+             ▼
+    ┌─────────────────┐
+    │ Audio Embeddings│ Output: (batch, frames, 512)
+    └─────────────────┘
+    
+    KEY MODIFICATIONS from standard Whisper:
+    1. base_model_prefix: Updated to allow direct `.from_pretrained()` on encoder
+    2. Flexible length: Allows audio shorter than 30 seconds (original requires exactly 30s)
+    3. Latency masking: Optional streaming mask for real-time applications
+    
+    PROCESSING DETAILS:
+    - Input: Mel spectrograms (80 mel bins, variable length)
+    - Conv layers: Reduce sequence length by stride factors
+    - Encoder layers: 6 transformer layers with self-attention
+    - Output: Feature embeddings of dimension 512
+    
+    This implementation is a slightly modified version of HF Transformers' Whisper Encoder:
     1. base_model_prefix updated to allow for doing `.from_pretrained` directly on the encoder
     2. allow less than 30 second of audio padding to be passed in:
         - relaxed ValueError check for `input_features` length to be less than or equal to `expected_seq_length` instead of strictly equal
@@ -974,10 +1459,25 @@ class ModifiedWhisperEncoder(
         )
 
 
+# ============================================================================
+# HUGGING FACE INTEGRATION: Model Registration
+# ============================================================================
+# These registrations allow the Ultravox model to be used with Hugging Face's
+# AutoModel and AutoConfig classes, making it easy to load from the Hub.
+
+# Register for automatic class discovery (used by Hugging Face Hub)
+# This enables the model to be automatically discovered when uploaded to HF Hub
 UltravoxConfig.register_for_auto_class()
 UltravoxModel.register_for_auto_class()
 
+# Register with AutoConfig: enables AutoConfig.from_pretrained("model-name")
+# When config.json has "model_type": "ultravox", it will use UltravoxConfig
 transformers.AutoConfig.register("ultravox", UltravoxConfig)
+
+# Register with AutoModel: enables AutoModel.from_pretrained("model-name")
+# When loading a model with UltravoxConfig, it automatically uses UltravoxModel
 transformers.AutoModel.register(UltravoxConfig, UltravoxModel)
 
+# Register custom activation function: makes SwiGLU available to transformers
+# This allows the projector to use "swiglu" as an activation function name in configs
 transformers.activations.ACT2FN["swiglu"] = SwiGLU
